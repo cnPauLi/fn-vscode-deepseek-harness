@@ -62,7 +62,8 @@
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `dshPanel.url` | `http://127.0.0.1:3080` | **要接入的 DSH 服务地址**（唯一入口）。扩展不会自动启动 dsh，需你自行先启动服务，如 `http://127.0.0.1:8080`；也可填 SSH 隧道转发地址 |
+| `dshPanel.url` | `http://127.0.0.1:3080` | **要接入的 DSH 服务地址（扩展侧访问用）**。扩展不会自动启动 dsh，需你自行先启动服务，如 `http://127.0.0.1:8080`；工作区注册与 Copilot 桥接走这里 |
+| `dshPanel.externalUrl` | 空 | **浏览器可达的 DSH 代理地址**，如 `https://thinknas:5667/app/lhp-code-server/proxy/3080/`。填写后面板与标签页的 iframe 直接加载它，不再使用受管认证代理——浏览器版 VS Code / Remote 下回环地址在 webview 侧不可达，此时就填这个 |
 | `dshPanel.authTokenFile` | 空 | DSH 的启动凭据：可填**令牌文件路径**，也可**直接填令牌本身**或含 `token=` 的认证链接。留空=不启用 |
 | `dshPanel.autoRegisterWorkspace` | `true` | 是否把当前工作区自动注册为 DSH 工作区 |
 | `dshPanel.installClipboardPlugin` | `true` | 是否写入内置 `dsh-webview-clipboard` 插件（修复 macOS 面板内编辑快捷键；Windows/Linux 上为惰性文件不影响行为）；是否启用由 DSH 侧决定 |
@@ -98,6 +99,24 @@ dsh `0.1.2-rc` 起为 Web GUI 启用了浏览器认证：每次 `dsh web` 启动
 3. 把 `dshPanel.url` 指向服务器上的 DSH 地址；当前工作区会自动注册进 DSH 工作区列表。
 
 如果 DSH 跑在另一台机器、且不是通过 VS Code Remote 连接的，可手动建隧道：`ssh -L 3080:127.0.0.1:3080 user@server`。
+
+### 浏览器版 VS Code / Remote 下面板打不开？配 `dshPanel.externalUrl`
+
+面板是把 DSH 页面放进 iframe 加载的，而这个 iframe 由 **webview 侧**（浏览器或你本机）去访问。本地桌面场景 webview 与扩展宿主同机，`http://127.0.0.1:3080` 就能开；但在**浏览器版 VS Code（如 `https://thinknas:5667/app/lhp-code-server/`）或 Remote-SSH** 下，webview 在客户端，回环地址指向的是客户端自己的本机——通常什么都没有，表现为面板与标签页**一片空白**。
+
+此时把「浏览器里能打开 DSH 的那个地址」填进 `dshPanel.externalUrl` 即可，例如：
+
+```jsonc
+{
+  "dshPanel.url": "http://127.0.0.1:3080",                                  // 扩展侧访问（工作区注册 / Copilot 桥接）
+  "dshPanel.externalUrl": "https://thinknas:5667/app/lhp-code-server/proxy/3080/"  // webview 侧加载
+}
+```
+
+填写后面板与标签页的 iframe **直接加载该地址**，不再使用受管认证代理（它的回环地址在客户端本就不可达）。认证由这条代理链路在浏览器侧完成——先用面板顶部的「在浏览器中打开」访问一次、让浏览器拿到 DSH 的 Cookie，面板内即可正常加载。
+
+> 前提：该地址本身在浏览器里能打开（例如证书受信任）。若浏览器控制台报
+> `Could not register service worker ... SSL certificate error`，那是 VS Code Web 的 webview 依赖 Service Worker、而站点证书不受信任所致，与本扩展无关（[code-server#3410](https://github.com/coder/code-server/issues/3410)）。需要让证书受信任，或改用 Firefox。
 
 ---
 

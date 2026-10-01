@@ -40,7 +40,12 @@
         "dshPanel.url": {
           "type": "string",
           "default": "http://127.0.0.1:3080",
-          "description": "要接入的 DSH 服务地址（本扩展不会自动启动 dsh，需你自行先启动服务），如 http://127.0.0.1:8080；也可填通过 SSH 隧道转发的地址"
+          "description": "要接入的 DSH 服务地址（本扩展不会自动启动 dsh，需你自行先启动服务），如 http://127.0.0.1:8080；也可填通过 SSH 隧道转发的地址。注意：该地址由**扩展宿主**访问，Remote / 浏览器版 VS Code 下若 webview 加载不到，请另配 dshPanel.externalUrl"
+        },
+        "dshPanel.externalUrl": {
+          "type": "string",
+          "default": "",
+          "description": "浏览器可达的 DSH 代理地址，如 https://thinknas:5667/app/lhp-code-server/proxy/3080/。填写后面板与标签页的 iframe **直接加载该地址**，不再使用受管认证代理（受管代理监听回环随机端口，在浏览器版 VS Code / Remote 的 webview 侧不可达）。扩展自身的工作区注册与 Copilot 桥接仍走 dshPanel.url；留空=按 dshPanel.url 自动推导"
         },
         "dshPanel.authTokenFile": {
           "type": "string",

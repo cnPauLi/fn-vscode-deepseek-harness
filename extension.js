@@ -36,10 +36,19 @@ function cfg() {
   return vscode.workspace.getConfiguration();
 }
 
-/** 面板要接入的 DSH 地址。本扩展不再启动 dsh，该地址必须由用户自行保证有服务在听。 */
+/** 面板要接入的 DSH 地址（**扩展侧**访问用）。本扩展不启动 dsh，需自行保证有服务在听。 */
 function getUrl() {
   const raw = String(cfg().get('dshPanel.url', DEFAULT_URL) || '').trim();
   return raw || DEFAULT_URL;
+}
+
+/**
+ * 浏览器可达的 DSH 代理地址（dshPanel.externalUrl）。非空时面板/标签页的 iframe
+ * **直接加载它**，不再使用受管认证代理——代理监听回环随机端口，在 Remote / 浏览器版
+ * VS Code 的 webview 侧不可达（webview 跑在客户端）。未配置返回空串。
+ */
+function getExternalUrl() {
+  return String(cfg().get('dshPanel.externalUrl', '') || '').trim();
 }
 
 /**
@@ -722,6 +731,13 @@ function probeDirectIndexStatus(timeoutMs = 4000) {
  * @returns {Promise<{displayUrl: string} | {unauthorized: true}>}
  */
 async function resolvePanelTarget(isTab) {
+  // 用户显式配置了「浏览器可达的代理地址」时直接用它：不再走受管认证代理
+  // （代理监听回环随机端口，浏览器版 VS Code / Remote 的 webview 侧不可达），
+  // 也不再做 401 预探测——认证由该代理链路在浏览器侧完成。
+  const externalUrl = getExternalUrl();
+  if (externalUrl) {
+    return { displayUrl: isTab ? getTabDisplayUrl(externalUrl) : externalUrl };
+  }
   let displayUrl = isTab ? getTabDisplayUrl(await resolveDisplayUrl()) : await resolveDisplayUrl();
   const proxy = await ensureAuthProxy();
   if (!proxy) {
@@ -1436,8 +1452,9 @@ function getTabDisplayUrl(displayUrl) {
  * @returns {Promise<{ok: true, html: string} | {ok: false, kind: 'unreachable'|'unloadable'|'unauthorized', reason: string}>}
  */
 async function preparePanelHtml(isTab) {
-  // 本扩展不启动 dsh：服务必须已经在 dshPanel.url 上监听着。
-  if (!await isServiceUp()) {
+  // 配置了 externalUrl 时 iframe 直接加载该代理地址，不要求本机能连上 dshPanel.url；
+  // 否则要求 dshPanel.url 上确实有服务在听（本扩展不启动 dsh）。
+  if (!getExternalUrl() && !await isServiceUp()) {
     return {
       ok: false,
       kind: 'unreachable',
