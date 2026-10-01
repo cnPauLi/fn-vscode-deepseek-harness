@@ -53,8 +53,22 @@ function cfg() {
   return vscode.workspace.getConfiguration();
 }
 
+// dshPanel.url 默认值对应的「协议 + 主机」（http://127.0.0.1，不含端口），
+// 用于在用户只改端口时按 dshPanel.port 重建地址。
+const DEFAULT_ORIGIN = (() => {
+  const u = new URL(DEFAULT_URL);
+  return `${u.protocol}//${u.hostname}`;
+})();
+
 function getUrl() {
-  return cfg().get('dshPanel.url', DEFAULT_URL);
+  const raw = String(cfg().get('dshPanel.url', DEFAULT_URL) || '').trim();
+  // dshPanel.url 仍是默认值（或留空）= 用户没动它：跟随 dshPanel.port 重建地址。
+  // 否则「只把 dshPanel.port 改成 8080」会让面板仍去连 3080，而 dsh 起在 8080，
+  // 探测地址与启动端口错配，表现为一直连不上（并残留一个额外实例）。
+  if (raw === '' || raw === DEFAULT_URL) {
+    return `${DEFAULT_ORIGIN}:${getPort()}`;
+  }
+  return raw;
 }
 
 // ── 配置输入净化（安全加固：以下设置项会经由 shell:true 的子进程，必须收敛到安全字符集）──
@@ -71,9 +85,29 @@ function getHost() {
 }
 
 function getPort() {
+  // dshPanel.url 被改成非默认地址且写明端口时，以它为准——面板实际访问的就是它，
+  // 自动启动 / 重启 / 释放端口必须落在同一端口，否则会出现「面板连 8080、
+  // dsh 起在 3080」的错配（配置只改 dshPanel.url 时的典型症状）。
+  const raw = String(cfg().get('dshPanel.url', DEFAULT_URL) || '').trim();
+  if (raw !== '' && raw !== DEFAULT_URL) {
+    const fromUrl = portFromUrl(raw);
+    if (fromUrl !== null) return fromUrl;
+  }
   // 强制整数 + 端口范围校验：堵 freePort 的 shell 拼接注入与 startDsh 参数注入。
   const n = Math.floor(Number(cfg().get('dshPanel.port', DEFAULT_PORT)));
   return Number.isFinite(n) && n >= 1 && n <= 65535 ? n : DEFAULT_PORT;
+}
+
+/** 取出地址里显式声明的端口；未写端口或非法返回 null（不猜测协议默认端口）。 */
+function portFromUrl(url) {
+  try {
+    const u = new URL(String(url));
+    if (!u.port) return null;
+    const n = Number(u.port);
+    return Number.isFinite(n) && n >= 1 && n <= 65535 ? n : null;
+  } catch {
+    return null;
+  }
 }
 
 /** 净化用户配置的命令：拒绝 shell 元字符（允许空格，Windows shell 启动前会加引号）。 */
@@ -511,6 +545,49 @@ function learnDshToken(tokenOrUrl) {
   return true;
 }
 
+// ── 外部受管 dsh 的令牌文件（可选配置）────────────────────────────────
+// dsh 若由扩展之外的进程拉起（例如 fnOS 打包应用由网关代理启动），扩展看不到它的
+// stdout，也就学不到「进程启动令牌」，面板只能停在 401 引导上等用户手动粘贴。
+// 这类管理器通常会把令牌落盘（fnOS 写在 <应用安装目录>/var/gateway/web.token，
+// 0600，内容即裸令牌）；配置 dshPanel.authTokenFile 指向该文件后，扩展自动跟随
+// 读取并完成认证，全程免手动粘贴。
+const AUTH_TOKEN_POLL_MS = 5000;
+let authTokenWatcher = null;
+
+/** 读取 dshPanel.authTokenFile 并学习其中的令牌（裸令牌或含 token= 的链接均可）。 */
+function learnTokenFromFile() {
+  const file = String(cfg().get('dshPanel.authTokenFile', '') || '').trim();
+  if (!file) return false;
+  let content;
+  try {
+    content = fs.readFileSync(file, 'utf8').trim();
+  } catch {
+    return false; // 文件不存在/无权限：静默失败，保持原有引导流程
+  }
+  const token = extractTokenParam(content);
+  if (!token || token === dshLaunchToken) return false;
+  return learnDshToken(content);
+}
+
+/** 启动令牌文件轮询：令牌随 dsh 重启变化，需持续跟随（配置为空则只清掉旧定时器）。 */
+function startAuthTokenWatcher() {
+  if (authTokenWatcher) {
+    clearInterval(authTokenWatcher);
+    authTokenWatcher = null;
+  }
+  learnTokenFromFile();
+  if (!String(cfg().get('dshPanel.authTokenFile', '') || '').trim()) return;
+  authTokenWatcher = setInterval(() => { learnTokenFromFile(); }, AUTH_TOKEN_POLL_MS);
+  if (typeof authTokenWatcher.unref === 'function') authTokenWatcher.unref();
+}
+
+function stopAuthTokenWatcher() {
+  if (authTokenWatcher) {
+    clearInterval(authTokenWatcher);
+    authTokenWatcher = null;
+  }
+}
+
 /**
  * 确保本地受管认证代理已启动（127.0.0.1 随机端口，仅本机可访问）。
  * Remote 场景或目标非回环地址时返回 null（维持原直连行为）。
@@ -556,7 +633,10 @@ async function ensureAuthProxy() {
         }
       } catch { /* 忽略缓存读取失败 */ }
     }
-    if (dshLaunchToken) proxy.onToken(dshLaunchToken);
+    // 外部受管 dsh（如 fnOS 打包应用）的令牌文件：命中则本次已由 learnDshToken
+    // 通知过代理，无需再重复 onToken。
+    const learnedFromFile = learnTokenFromFile();
+    if (dshLaunchToken && !learnedFromFile) proxy.onToken(dshLaunchToken);
     return proxy;
   })();
   const result = await authProxyPromise;
@@ -3437,6 +3517,13 @@ function activate(context) {
   gContext = context;
   registerDshModelProvider(context);
 
+  // 外部受管 dsh 的令牌文件轮询（仅配置了 dshPanel.authTokenFile 时生效）；
+  // 配置变更时重启轮询，让新增/改路径立刻生效，无需重载窗口。
+  startAuthTokenWatcher();
+  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((e) => {
+    if (e.affectsConfiguration('dshPanel.authTokenFile')) startAuthTokenWatcher();
+  }));
+
   const provider = {
     resolveWebviewView(view) {
       activeView = view;
@@ -3681,6 +3768,7 @@ function activate(context) {
 }
 
 function deactivate() {
+  stopAuthTokenWatcher();
   // 扩展停用时，按配置决定是否结束由本扩展启动的 dsh 进程。
   const killOnDispose = cfg().get('dshPanel.killOnDispose', true);
   if (killOnDispose && managedChild) {
@@ -3702,6 +3790,9 @@ module.exports.__internals = {
   createAuthProxy,
   ensureAuthProxy,
   learnDshToken,
+  learnTokenFromFile,
+  startAuthTokenWatcher,
+  stopAuthTokenWatcher,
   extractTokenParam,
   apiBase,
   normAuthority,
@@ -3709,6 +3800,7 @@ module.exports.__internals = {
   clipboardPluginFiles,
   CLIPBOARD_PLUGIN_NAME,
   sanitizeCommand,
+  getUrl,
   getHost,
   getPort,
   getDshCommand,

@@ -1,9 +1,9 @@
 {
-  "name": "deepseek-harness-vscode",
-  "displayName": "DeepSeek Harness for VSCode",
+  "name": "fn-vscode-deepseek-harness",
+  "displayName": "FN VSCode DeepSeek Harness",
   "description": "DeepSeek Harness (DSH) 的 VS Code 接入：侧边栏/标签页忠实呈现 DSH Web GUI 并自动检测启动，不影响用户对 DSH 本身的页面组织、第三方插件装配等二次开发行为；v0.7.13 起把 DSH 注册为 Copilot 聊天模型「DSH (DeepSeek Harness)、DeepSeek-V4-Pro (DSH)、DeepSeek-V4-Flash (DSH)……」——接收 Copilot 组织好的现成对话、滤除对话内容无关的 prompt、交给 DSH 二次组织、流式回写，旨在利用 DSH 强大的任务编排与工具调用能力，发挥最大性能",
   "version": "0.8.45",
-  "publisher": "vithrive",
+  "publisher": "lhp",
   "license": "MIT",
   "icon": "media/icon.png",
   "repository": {
@@ -39,7 +39,7 @@
         "dshPanel.url": {
           "type": "string",
           "default": "http://127.0.0.1:3080",
-          "description": "DeepSeek Harness Web GUI 地址（本地或通过 SSH 隧道转发的地址）"
+          "description": "DeepSeek Harness Web GUI 地址（本地或通过 SSH 隧道转发的地址）。地址里显式写明的端口会用于自动启动/重启 dsh，因此改这一个即可（如 http://127.0.0.1:8080）"
         },
         "dshPanel.host": {
           "type": "string",
@@ -49,7 +49,12 @@
         "dshPanel.port": {
           "type": "number",
           "default": 3080,
-          "description": "自动启动 dsh 时监听的端口"
+          "description": "自动启动 dsh 时监听的端口（dshPanel.url 为默认值时才以此为准，改后扩展会让面板地址同步跟随该端口）"
+        },
+        "dshPanel.authTokenFile": {
+          "type": "string",
+          "default": "",
+          "description": "外部启动的 dsh web 的「启动令牌文件」路径：dsh 不是由本扩展启动时（如 fnOS 打包应用由网关拉起），扩展看不到它的 stdout，配置此文件后会自动跟随读取并完成浏览器认证，无需手动粘贴认证链接。文件内容为裸令牌，fnOS 应用默认写在 <应用安装目录>/var/gateway/web.token；留空=不启用"
         },
         "dshPanel.autoStart": {
           "type": "boolean",
