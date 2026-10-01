@@ -3021,7 +3021,10 @@ async function handleDshModelRequest(model, messages, options, progress, token) 
       }
       return;
     }
-    const installed = await ensureDshInstalled();
+    // 与面板一致：服务已在运行时不需要本机 dsh（DSH 可能由 fnOS 打包应用等外部进程
+    // 托管）；本机 dsh 只在「服务没跑、需要自动启动」时才有必要。
+    const serviceAlreadyUp = await checkUrl(getUrl());
+    const installed = serviceAlreadyUp || await ensureDshInstalled();
     if (!installed) {
       progress.report(makeTextPart('❌ 未检测到 DeepSeek Harness (dsh)。请安装 npm install -g @deepseek-ai/dsh，或打开 DSH 面板触发自动安装。'));
       return;
