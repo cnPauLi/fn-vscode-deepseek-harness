@@ -55,7 +55,7 @@
         "dshPanel.authTokenFile": {
           "type": "string",
           "default": "",
-          "description": "外部启动的 dsh web 的「启动令牌文件」路径：dsh 不是由本扩展启动时（如 fnOS 打包应用由网关拉起），扩展看不到它的 stdout，配置此文件后会自动跟随读取并完成浏览器认证，无需手动粘贴认证链接。文件内容为裸令牌，fnOS 应用默认写在 <应用安装目录>/var/gateway/web.token；留空=不启用"
+          "description": "外部启动的 dsh web 的启动凭据：可填「令牌文件路径」，也可直接填令牌本身或含 token= 的认证链接（两者都支持）。dsh 不是由本扩展启动时（如 fnOS 打包应用由网关拉起），扩展看不到它的 stdout，配置此项后会自动完成浏览器认证，无需手动粘贴。填文件路径时 dsh 重启换令牌可自动跟随（fnOS 应用默认写在 <应用安装目录>/var/gateway/web.token）；留空=不启用"
         },
         "dshPanel.autoStart": {
           "type": "boolean",

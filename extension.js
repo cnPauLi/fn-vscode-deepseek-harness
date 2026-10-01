@@ -245,9 +245,11 @@ function installDsh() {
 
 /**
  * 确保 dsh 已安装。未安装时，按配置提示用户并代为安装。
+ * @param {{silent?: boolean}} [opts] silent=true 时只探测、不弹安装引导
+ *   （服务已由外部进程托管时使用：本机没有 dsh 也应照常接入）。
  * @returns {Promise<boolean>} 最终是否已安装可用。
  */
-async function ensureDshInstalled() {
+async function ensureDshInstalled(opts = {}) {
   // 已解析成功过的启动方式直接复用（15 分钟内）：避免每次提问都起子进程探测
   // dsh/npx（并发聊天时重复探测会拖慢扩展宿主、造成后一个聊天卡顿）。
   if (dshInvocation && (Date.now() - dshInvocationAt) < 15 * 60 * 1000) {
@@ -259,6 +261,8 @@ async function ensureDshInstalled() {
     dshInvocationAt = Date.now();
     return true;
   }
+
+  if (opts.silent) return false;
 
   if (!cfg().get('dshPanel.autoInstallDsh', true)) {
     return false;
@@ -556,14 +560,15 @@ let authTokenWatcher = null;
 
 /** 读取 dshPanel.authTokenFile 并学习其中的令牌（裸令牌或含 token= 的链接均可）。 */
 function learnTokenFromFile() {
-  const file = String(cfg().get('dshPanel.authTokenFile', '') || '').trim();
-  if (!file) return false;
-  let content;
+  const raw = String(cfg().get('dshPanel.authTokenFile', '') || '').trim();
+  if (!raw) return false;
+  // 优先按文件路径读取（dsh 重启换令牌时能自动跟随）；读不到就按字面值处理——
+  // 直接填令牌本身或含 token= 的认证链接同样接受，避免「填了却没生效」。
+  let content = raw;
   try {
-    content = fs.readFileSync(file, 'utf8').trim();
-  } catch {
-    return false; // 文件不存在/无权限：静默失败，保持原有引导流程
-  }
+    const fromFile = fs.readFileSync(raw, 'utf8').trim();
+    if (fromFile) content = fromFile;
+  } catch { /* 不是可读文件 → 按字面值处理 */ }
   const token = extractTokenParam(content);
   if (!token || token === dshLaunchToken) return false;
   return learnDshToken(content);
@@ -2022,9 +2027,13 @@ function getTabDisplayUrl(displayUrl) {
  * @returns {Promise<{ok: true, html: string} | {ok: false, kind: 'not-installed'|'unreachable'|'unloadable'|'unauthorized', reason: string}>}
  */
 async function preparePanelHtml(isTab) {
-  // 先确保 dsh 已安装（远程场景即在服务器上检查/安装）。
-  const installed = await ensureDshInstalled();
-  if (!installed) {
+  // 本机 dsh 只用于「自动启动」与「本地插件管理」。服务已经在跑时（DSH 由 fnOS
+  // 打包应用等外部进程托管）不应因本机没有 dsh 可执行文件而拒绝接入或弹安装提示。
+  const serviceAlreadyUp = await checkUrl(getUrl());
+  const dshReady = serviceAlreadyUp
+    ? await ensureDshInstalled({ silent: true })
+    : await ensureDshInstalled();
+  if (!dshReady && !serviceAlreadyUp) {
     return {
       ok: false,
       kind: 'not-installed',
@@ -2032,11 +2041,13 @@ async function preparePanelHtml(isTab) {
     };
   }
 
-  // 自动确保 DSH 侧配套插件 dsh-drop-caret 在位（拖文件/代码段插入对话框）。
-  const pluginInstalled = await ensureDshPlugins();
-  if (pluginInstalled && (await checkUrl(getUrl()))) {
-    // 服务已在运行但插件刚装上，需重启 dsh web 才加载。
-    vscode.window.showInformationMessage('已自动安装/更新 DSH 插件（dsh-drop-caret / dsh-webview-clipboard），请点击面板顶部的「重启 dsh web」使其生效。');
+  if (dshReady) {
+    // 自动确保 DSH 侧配套插件 dsh-drop-caret 在位（拖文件/代码段插入对话框）。
+    const pluginInstalled = await ensureDshPlugins();
+    if (pluginInstalled && serviceAlreadyUp) {
+      // 服务已在运行但插件刚装上，需重启 dsh web 才加载。
+      vscode.window.showInformationMessage('已自动安装/更新 DSH 插件（dsh-drop-caret / dsh-webview-clipboard），请点击面板顶部的「重启 dsh web」使其生效。');
+    }
   }
 
   const ok = await ensureRunningOnce();
@@ -3797,6 +3808,7 @@ module.exports.__internals = {
   apiBase,
   normAuthority,
   startDshAndWaitReady,
+  preparePanelHtml,
   clipboardPluginFiles,
   CLIPBOARD_PLUGIN_NAME,
   sanitizeCommand,
