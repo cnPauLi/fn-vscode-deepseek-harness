@@ -48,6 +48,48 @@ function getJson(port, reqPath, method, body) {
   });
 }
 
+/** 拉起一个供测试使用的 dsh web 实例（扩展本身不再启动 dsh）。 */
+function spawnDshWeb(port) {
+  return spawn('dsh', ['web', '--host', '127.0.0.1', '--port', String(port), '--no-open'], {
+    cwd: os.homedir(),
+    shell: process.platform === 'win32',
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+}
+
+/** 从 dsh web 的 stdout 捕获形如 `dsh web: http://…/?token=…` 的认证链接。 */
+function captureDshAuth(child, timeoutMs = 120000) {
+  let buf = '';
+  let authLine = null;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('120 秒内未捕获 dsh web 认证链接')), timeoutMs);
+    child.stdout.on('data', (chunk) => {
+      buf += chunk.toString('utf8');
+      let idx;
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx).replace(/\r$/, '');
+        buf = buf.slice(idx + 1);
+        if (line.trim()) console.log('    | ' + line.slice(0, 160));
+        const m = line.match(/dsh web:\s*(\S+)/);
+        if (m && /[?&]token=/.test(m[1]) && !authLine) {
+          authLine = m[1];
+          clearTimeout(timer);
+          resolve(authLine);
+        }
+      }
+      if (buf.length > 256 * 1024) buf = '';
+    });
+    child.stderr.on('data', (c) => {
+      const s = c.toString('utf8').trimEnd();
+      if (s) console.error('    ! ' + s.slice(0, 160));
+    });
+    child.on('exit', (code) => {
+      if (!authLine) { clearTimeout(timer); reject(new Error('dsh 提前退出 code=' + code)); }
+    });
+  });
+}
+
 async function main() {
   if (!(await portFree(PORT))) {
     console.error('端口 ' + PORT + ' 被占用，请释放后重试。');
@@ -80,43 +122,10 @@ async function main() {
   const ext = require(path.join(__dirname, '..', 'extension.js'));
   const { ensureAuthProxy, learnDshToken } = ext.__internals;
 
-  // ---- 启动真实 dsh web（与扩展同款 spawn 方式）----
+  // ---- 启动真实 dsh web（扩展自身不再启动 dsh，测试自行拉起实例）----
   console.log('[1] 启动 dsh web --port ' + PORT + ' --no-open …');
-  const child = spawn('dsh', ['web', '--host', '127.0.0.1', '--port', String(PORT), '--no-open'], {
-    cwd: os.homedir(),
-    shell: process.platform === 'win32',
-    windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-  let authLine = null;
-  let buf = '';
-  const authReady = new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('120 秒内未捕获 dsh web 认证链接')), 120000);
-    const onData = (chunk) => {
-      buf += chunk.toString('utf8');
-      let idx;
-      while ((idx = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, idx).replace(/\r$/, '');
-        buf = buf.slice(idx + 1);
-        if (line.trim()) console.log('    | ' + line.slice(0, 160));
-        const m = line.match(/dsh web:\s*(\S+)/);
-        if (m && /[?&]token=/.test(m[1]) && !authLine) {
-          authLine = m[1];
-          clearTimeout(timer);
-          resolve(authLine);
-        }
-      }
-      if (buf.length > 256 * 1024) buf = '';
-    };
-    child.stdout.on('data', onData);
-    child.stderr.on('data', (c) => {
-      const s = c.toString('utf8').trimEnd();
-      if (s) console.error('    ! ' + s.slice(0, 160));
-    });
-    child.on('exit', (code) => {
-      if (!authLine) { clearTimeout(timer); reject(new Error('dsh 提前退出 code=' + code)); }
-    });
-  });
+  const child = spawnDshWeb(PORT);
+  const authReady = captureDshAuth(child);
 
   let failed = null;
   let killedOwnChild = false; // [5] 阶段会杀掉自拉起实例，改由扩展函数拉起新实例
@@ -198,7 +207,7 @@ async function main() {
     assert.ok(pgParsed.result && pgParsed.result.ok === true && Array.isArray(pgParsed.result.value.records), 'session/page 应返回 records：' + pg.body.slice(0, 200));
     console.log('    POST 代理 /api/session/page → ok（records=' + pgParsed.result.value.records.length + '，hasMore=' + pgParsed.result.value.hasMore + '）');
 
-    console.log('[5] 真实重启场景（与扩展「重启 dsh web」同路径）');
+    console.log('[5] 上游换令牌场景（扩展不再启动 dsh，由测试自行拉起新实例）');
     const tokenBeforeRestart = proxy.token();
     // 杀掉 E2E 自己拉起的实例，释放端口（Windows taskkill / POSIX SIGKILL）
     if (process.platform === 'win32' && child.pid) {
@@ -210,12 +219,13 @@ async function main() {
     }
     for (let i = 0; i < 20; i++) { await sleep(500); if (await portFree(PORT)) break; }
     assert.ok(await portFree(PORT), '端口应已释放');
-    // 走生产函数重启（内部等待「认证链接打印」这一完全启动信号）
+    // 扩展不再启动 dsh：由测试自己拉起新实例、把新令牌喂给扩展，
+    // 验证「上游换令牌后代理自动重换 Cookie」这一原重启路径的核心断言。
     const restartStart = Date.now();
-    const restartOk = await ext.__internals.startDshAndWaitReady(DSH_URL);
-    const restartMs = Date.now() - restartStart;
-    assert.ok(restartOk, 'startDshAndWaitReady 应成功');
-    console.log('    重启就绪耗时 ' + restartMs + 'ms');
+    const child2 = spawnDshWeb(PORT);
+    const newAuthLine = await captureDshAuth(child2);
+    assert.ok(learnDshToken(newAuthLine), '应学习到新进程的令牌');
+    console.log('    新实例就绪耗时 ' + (Date.now() - restartStart) + 'ms');
     assert.notStrictEqual(proxy.token(), tokenBeforeRestart, '应捕获到新进程的令牌');
     assert.ok(proxy.hasCookieForBase(), '重启后 Cookie 应就绪');
     let selfStatus = 0;

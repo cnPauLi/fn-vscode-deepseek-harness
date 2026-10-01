@@ -40,57 +40,22 @@
         "dshPanel.url": {
           "type": "string",
           "default": "http://127.0.0.1:3080",
-          "description": "DeepSeek Harness Web GUI 地址（本地或通过 SSH 隧道转发的地址）。地址里显式写明的端口会用于自动启动/重启 dsh，因此改这一个即可（如 http://127.0.0.1:8080）"
-        },
-        "dshPanel.host": {
-          "type": "string",
-          "default": "127.0.0.1",
-          "description": "自动启动 dsh 时绑定的主机地址"
-        },
-        "dshPanel.port": {
-          "type": "number",
-          "default": 3080,
-          "description": "自动启动 dsh 时监听的端口（dshPanel.url 为默认值时才以此为准，改后扩展会让面板地址同步跟随该端口）"
+          "description": "要接入的 DSH 服务地址（本扩展不会自动启动 dsh，需你自行先启动服务），如 http://127.0.0.1:8080；也可填通过 SSH 隧道转发的地址"
         },
         "dshPanel.authTokenFile": {
           "type": "string",
           "default": "",
-          "description": "外部启动的 dsh web 的启动凭据：可填「令牌文件路径」，也可直接填令牌本身或含 token= 的认证链接（两者都支持）。dsh 不是由本扩展启动时（如 fnOS 打包应用由网关拉起），扩展看不到它的 stdout，配置此项后会自动完成浏览器认证，无需手动粘贴。填文件路径时 dsh 重启换令牌可自动跟随（fnOS 应用默认写在 <应用安装目录>/var/gateway/web.token）；留空=不启用"
-        },
-        "dshPanel.autoStart": {
-          "type": "boolean",
-          "default": true,
-          "description": "检测到 DSH 未运行时，是否自动执行 dsh web 启动它"
+          "description": "DSH 服务的启动凭据：可填「令牌文件路径」，也可直接填令牌本身或含 token= 的认证链接（两者都支持）。服务不是由本扩展启动时（如 fnOS 打包应用由网关拉起），扩展看不到它的 stdout，配置此项后会自动完成浏览器认证，无需手动粘贴。填文件路径时 DSH 重启换令牌可自动跟随（fnOS 应用默认写在 <应用安装目录>/var/gateway/web.token）；留空=不启用"
         },
         "dshPanel.autoRegisterWorkspace": {
           "type": "boolean",
           "default": true,
           "description": "是否把 VS Code 当前工作区自动注册为 DSH 工作区（新会话默认使用该工作区）"
         },
-        "dshPanel.openSystemBrowser": {
-          "type": "boolean",
-          "default": false,
-          "description": "扩展启动 dsh web 时是否保留弹系统浏览器的旧行为（默认关闭：新版 dsh web 的浏览器认证由扩展自动完成，面板内即用）"
-        },
         "dshPanel.installClipboardPlugin": {
           "type": "boolean",
           "default": true,
-          "description": "自动安装内置 dsh-webview-clipboard 插件（修复 macOS 面板内复制/粘贴等编辑快捷键失效；Windows/Linux 上为惰性文件不影响行为）。若怀疑影响 dsh web 启动可关闭后对比"
-        },
-        "dshPanel.autoInstallDsh": {
-          "type": "boolean",
-          "default": true,
-          "description": "检测到当前环境（含远程服务器）未安装 dsh 时，是否提示并代为安装（npm install -g @deepseek-ai/dsh）"
-        },
-        "dshPanel.dshCommand": {
-          "type": "string",
-          "default": "dsh",
-          "description": "dsh 命令（默认从 PATH 解析；如需指定完整路径，例如 C:\\Users\\you\\AppData\\Roaming\\npm\\dsh.cmd）"
-        },
-        "dshPanel.killOnDispose": {
-          "type": "boolean",
-          "default": true,
-          "description": "扩展停用或 VS Code 关闭时，是否结束由本扩展启动的 dsh 进程（不影响你手动启动的 dsh）"
+          "description": "自动安装内置 dsh-webview-clipboard 插件（修复 macOS 面板内复制/粘贴等编辑快捷键失效；Windows/Linux 上为惰性文件不影响行为）。插件的启用/停用由 DSH 侧决定，本项只控制是否写入该插件文件"
         },
         "dshPanel.chatAgentPreset": {
           "type": "string",
@@ -175,11 +140,6 @@
         "icon": "$(refresh)"
       },
       {
-        "command": "dshPanel.restart",
-        "title": "DeepSeek Harness: 重启 dsh web",
-        "icon": "$(debug-restart)"
-      },
-      {
         "command": "dsh.sendSelection",
         "title": "DeepSeek Harness: 发送选中内容到对话框"
       },
@@ -207,11 +167,6 @@
       "view/title": [
         {
           "command": "dshPanel.refresh",
-          "when": "view == dsh.webview",
-          "group": "navigation"
-        },
-        {
-          "command": "dshPanel.restart",
           "when": "view == dsh.webview",
           "group": "navigation"
         },

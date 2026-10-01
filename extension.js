@@ -3,7 +3,7 @@ const http = require('http');
 const https = require('https');
 const os = require('os');
 const crypto = require('crypto');
-const { spawn, exec, execFile } = require('child_process');
+const { spawn, exec } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
@@ -12,14 +12,6 @@ const DEFAULT_URL = 'http://127.0.0.1:3080';
 
 // 当前 webview 视图引用，供“刷新”命令使用。
 let activeView = null;
-// 由扩展自己启动的 dsh 子进程；复用已有服务时不记录、不管理。
-let managedChild = null;
-// 防止多个视图实例同时触发启动。
-let ensurePromise = null;
-// 解析出的 dsh 启动方式：{ cmd, prefix }。null 表示尚未解析或都不可用。
-// 优先全局安装（dsh 命令），其次 npx 缓存安装（npx 安装不会写入全局 PATH）。
-let dshInvocation = null;
-let dshInvocationAt = 0;
 // 编辑器标签页模式：当前打开的 DSH 标签页 panel（未打开时为 null）。
 let activeTab = null;
 // 扩展上下文（globalState 持久化会话映射）。
@@ -32,15 +24,6 @@ let dshLaunchToken = null;
 let authProxy = null;
 // ensureAuthProxy 的并发去重：多个视图/API 同时触发时只创建一次。
 let authProxyPromise = null;
-// 老版本 dsh 不识别 --no-open 时置位（启动快速退出后自动去掉该参数重试）。
-let dshNoOpenBroken = false;
-// dsh 是否支持 web 浏览器认证（首次捕获 stdout 令牌行置 true；
-// 确认为老版 dsh 后置 false 并持久化，启动等待逻辑据此跳过）。
-let dshAuthCapable;
-// 「dsh web: <url>」打印行的最后时间戳（新旧版本都打印，作为完全启动信号）。
-let dshBootAnnouncedAt = 0;
-// 进程内缓存的 --no-open 支持探测结果（undefined=未探测）。
-let dshNoOpenSupported;
 // 认证引导提示的上次弹出时间（冷却，避免反复打扰）。
 let lastAuthPromptAt = 0;
 // 标签页模式的重载函数（供认证引导完成后重新渲染标签页）。
@@ -53,254 +36,10 @@ function cfg() {
   return vscode.workspace.getConfiguration();
 }
 
-// dshPanel.url 默认值对应的「协议 + 主机」（http://127.0.0.1，不含端口），
-// 用于在用户只改端口时按 dshPanel.port 重建地址。
-const DEFAULT_ORIGIN = (() => {
-  const u = new URL(DEFAULT_URL);
-  return `${u.protocol}//${u.hostname}`;
-})();
-
+/** 面板要接入的 DSH 地址。本扩展不再启动 dsh，该地址必须由用户自行保证有服务在听。 */
 function getUrl() {
   const raw = String(cfg().get('dshPanel.url', DEFAULT_URL) || '').trim();
-  // dshPanel.url 仍是默认值（或留空）= 用户没动它：跟随 dshPanel.port 重建地址。
-  // 否则「只把 dshPanel.port 改成 8080」会让面板仍去连 3080，而 dsh 起在 8080，
-  // 探测地址与启动端口错配，表现为一直连不上（并残留一个额外实例）。
-  if (raw === '' || raw === DEFAULT_URL) {
-    return `${DEFAULT_ORIGIN}:${getPort()}`;
-  }
-  return raw;
-}
-
-// ── 配置输入净化（安全加固：以下设置项会经由 shell:true 的子进程，必须收敛到安全字符集）──
-// 主机名白名单：IPv4/IPv6 字面量与域名。
-const HOST_PATTERN = /^[A-Za-z0-9._:-]+$/;
-// shell 元字符：出现即拒绝（cmd.exe 与 POSIX sh 都会解释）。
-const SHELL_META_PATTERN = /[&|<>^%!"`;]|\r|\n/;
-const DEFAULT_PORT = 3080;
-
-function getHost() {
-  const raw = String(cfg().get('dshPanel.host', '127.0.0.1') || '').trim();
-  // 非法（含 shell 元字符等）一律回退默认回环地址，堵 startDsh 参数注入。
-  return HOST_PATTERN.test(raw) ? raw : '127.0.0.1';
-}
-
-function getPort() {
-  // dshPanel.url 被改成非默认地址且写明端口时，以它为准——面板实际访问的就是它，
-  // 自动启动 / 重启 / 释放端口必须落在同一端口，否则会出现「面板连 8080、
-  // dsh 起在 3080」的错配（配置只改 dshPanel.url 时的典型症状）。
-  const raw = String(cfg().get('dshPanel.url', DEFAULT_URL) || '').trim();
-  if (raw !== '' && raw !== DEFAULT_URL) {
-    const fromUrl = portFromUrl(raw);
-    if (fromUrl !== null) return fromUrl;
-  }
-  // 强制整数 + 端口范围校验：堵 freePort 的 shell 拼接注入与 startDsh 参数注入。
-  const n = Math.floor(Number(cfg().get('dshPanel.port', DEFAULT_PORT)));
-  return Number.isFinite(n) && n >= 1 && n <= 65535 ? n : DEFAULT_PORT;
-}
-
-/** 取出地址里显式声明的端口；未写端口或非法返回 null（不猜测协议默认端口）。 */
-function portFromUrl(url) {
-  try {
-    const u = new URL(String(url));
-    if (!u.port) return null;
-    const n = Number(u.port);
-    return Number.isFinite(n) && n >= 1 && n <= 65535 ? n : null;
-  } catch {
-    return null;
-  }
-}
-
-/** 净化用户配置的命令：拒绝 shell 元字符（允许空格，Windows shell 启动前会加引号）。 */
-function sanitizeCommand(cmd) {
-  const s = String(cmd || '').trim();
-  if (!s || SHELL_META_PATTERN.test(s)) return null;
-  return s;
-}
-
-function getDshCommand() {
-  // 配置了非法命令（含元字符）时回退 'dsh'，后续探测失败会自然落到 npx 兜底。
-  return sanitizeCommand(cfg().get('dshPanel.dshCommand', 'dsh')) || 'dsh';
-}
-
-/**
- * 执行一条命令并判断是否成功（exit code === 0）。
- * 在扩展运行的机器上执行 —— 本地场景即本机，Remote/vscode-server 场景即远程服务器。
- * @param {string} cmd
- * @param {string[]} args
- * @param {number} timeoutMs
- * @returns {Promise<boolean>}
- */
-function runCommandOk(cmd, args, timeoutMs = 15000) {
-  return new Promise((resolve) => {
-    // 纵深校验（PR #12 思路）：cmd 来自 getDshCommand()（已净化），此处再拒一次。
-    if (typeof cmd !== 'string' || cmd === '' || SHELL_META_PATTERN.test(cmd)) {
-      resolve(false);
-      return;
-    }
-    // 与 startDsh 同规则：含空格且确实是一个存在的文件 → 加引号；多 token 前缀 → shell 分词。
-    // POSIX 上 shell:false 参数按数组直达进程（无解释器、无注入面）；
-    // Windows 上 shell:true 为命中 dsh.cmd shim 所必需（Node ≥18.20 无 shell 执行
-    // .cmd 会抛 EINVAL，CVE-2024-27980 防护），注入面由上方的净化+白名单收敛。
-    const cmdText = (process.platform === 'win32' && /\s/.test(cmd) && fs.existsSync(cmd)) ? '"' + cmd + '"' : cmd;
-    const child = spawn(cmdText, args, {
-      shell: process.platform === 'win32',
-      stdio: 'ignore',
-      windowsHide: true
-    });
-    let settled = false;
-    const finish = (value) => {
-      if (!settled) {
-        settled = true;
-        resolve(value);
-      }
-    };
-    child.on('error', () => finish(false));
-    child.on('exit', (code) => finish(code === 0));
-    setTimeout(() => {
-      try { child.kill(); } catch (_) { /* noop */ }
-      finish(false);
-    }, timeoutMs);
-  });
-}
-
-/**
- * 执行命令并捕获 stdout（用于探测 dsh 能力，如 `dsh web --help`）。
- * @param {string} cmd
- * @param {string[]} args
- * @param {number} timeoutMs
- * @returns {Promise<string>} stdout（失败抛错）
- */
-function runCommandOutput(cmd, args, timeoutMs = 12000) {
-  return new Promise((resolve, reject) => {
-    // 纵深校验（PR #12 思路）：同 runCommandOk。
-    if (typeof cmd !== 'string' || cmd === '' || SHELL_META_PATTERN.test(cmd)) {
-      reject(new Error('命令包含 shell 元字符或为空，已拒绝执行'));
-      return;
-    }
-    if (process.platform === 'win32') {
-      // Windows：dsh 为 .cmd shim，必须经 cmd.exe（无 shell 会 EINVAL/ENOENT，
-      // 见 CVE-2024-27980 防护）；cmd/参数均已净化，含空格文件路径加引号。
-      const quoted = (/\s/.test(cmd) && fs.existsSync(cmd)) ? `"${cmd}"` : cmd;
-      exec(`${quoted} ${args.join(' ')}`, {
-        timeout: timeoutMs,
-        windowsHide: true,
-        maxBuffer: 1024 * 1024
-      }, (err, stdout) => {
-        if (err) reject(err);
-        else resolve(String(stdout || ''));
-      });
-    } else {
-      // POSIX：execFile 无 shell——参数按数组直达进程（采纳 PR #12 的第二层防御：
-      // 即使净化被绕过，元字符也只是字面文件名字符，不会注入）。
-      execFile(cmd, args, {
-        timeout: timeoutMs,
-        windowsHide: true,
-        maxBuffer: 1024 * 1024
-      }, (err, stdout) => {
-        if (err) reject(err);
-        else resolve(String(stdout || ''));
-      });
-    }
-  });
-}
-
-/**
- * 解析可用的 dsh 启动方式，返回 { cmd, prefix } 或 null。
- * 1) 优先配置的 dsh 命令（默认 'dsh'，即 npm 全局安装、已写入 PATH）；
- * 2) 回退到 npx 缓存安装（npx 安装只缓存到 npx 目录，不写全局 PATH，
- *    此时 'dsh' 不在 PATH 里，但 'npx @deepseek-ai/dsh' 仍可运行）。
- * 探测 npx 用 --no-install：只检查本地/全局/npx 缓存，缺失时不触发下载，
- * 从而保留「完全未安装时弹出安装提示」的既有流程。
- * @returns {Promise<{cmd: string, prefix: string[]} | null>}
- */
-async function resolveDshInvocation() {
-  const cmd = getDshCommand();
-  if (await runCommandOk(cmd, ['--version'])) {
-    return { cmd, prefix: [] };
-  }
-  if (await runCommandOk('npx', ['--no-install', '@deepseek-ai/dsh', '--version'])) {
-    return { cmd: 'npx', prefix: ['--yes', '@deepseek-ai/dsh'] };
-  }
-  return null;
-}
-
-/**
- * 安装 dsh（npm 全局安装）。在远程场景即在服务器上执行。
- * @returns {Promise<void>}
- */
-function installDsh() {
-  return new Promise((resolve, reject) => {
-    exec('npm install -g @deepseek-ai/dsh', {
-      timeout: 300000,
-      windowsHide: true
-    }, (err, _stdout, stderr) => {
-      if (err) {
-        reject(new Error((stderr || '').trim() || err.message));
-      } else {
-        resolve();
-      }
-    });
-  });
-}
-
-/**
- * 确保 dsh 已安装。未安装时，按配置提示用户并代为安装。
- * @param {{silent?: boolean}} [opts] silent=true 时只探测、不弹安装引导
- *   （服务已由外部进程托管时使用：本机没有 dsh 也应照常接入）。
- * @returns {Promise<boolean>} 最终是否已安装可用。
- */
-async function ensureDshInstalled(opts = {}) {
-  // 已解析成功过的启动方式直接复用（15 分钟内）：避免每次提问都起子进程探测
-  // dsh/npx（并发聊天时重复探测会拖慢扩展宿主、造成后一个聊天卡顿）。
-  if (dshInvocation && (Date.now() - dshInvocationAt) < 15 * 60 * 1000) {
-    return true;
-  }
-  const inv = await resolveDshInvocation();
-  if (inv) {
-    dshInvocation = inv;
-    dshInvocationAt = Date.now();
-    return true;
-  }
-
-  if (opts.silent) return false;
-
-  if (!cfg().get('dshPanel.autoInstallDsh', true)) {
-    return false;
-  }
-
-  const choice = await vscode.window.showWarningMessage(
-    '检测到当前环境未安装 DeepSeek Harness (dsh)，是否现在安装？',
-    { modal: true },
-    '安装'
-  );
-  if (choice !== '安装') {
-    return false;
-  }
-
-  const installed = await vscode.window.withProgress({
-    location: vscode.ProgressLocation.Notification,
-    title: '正在安装 DeepSeek Harness（npm install -g @deepseek-ai/dsh）…',
-    cancellable: false
-  }, async () => {
-    try {
-      await installDsh();
-      return true;
-    } catch (e) {
-      vscode.window.showErrorMessage(`DeepSeek Harness 安装失败：${e.message}`);
-      return false;
-    }
-  });
-
-  if (!installed) {
-    return false;
-  }
-  const after = await resolveDshInvocation();
-  if (after) {
-    dshInvocation = after;
-    dshInvocationAt = Date.now();
-    return true;
-  }
-  return false;
+  return raw || DEFAULT_URL;
 }
 
 /**
@@ -517,27 +256,16 @@ function extractTokenParam(input) {
 }
 
 /**
- * 学习/更新 dsh 启动令牌（来自 stdout 行或用户粘贴的认证链接）。
+ * 学习/更新 dsh 启动令牌（来自 dshPanel.authTokenFile 或用户粘贴的认证链接）。
  * 更新后立即为代理的本机来源（127.0.0.1 / localhost）静默换发 Cookie，
  * 并把令牌缓存进 globalState，供其他 VS Code 窗口 / 重载后复用（免打扰）。
  * @param {string} tokenOrUrl
  * @returns {boolean} 是否成功提取到令牌
  */
-/** 记录/持久化 dsh 的 web 认证能力（true=支持，false=老版无认证）。 */
-function setDshAuthCapable(value) {
-  dshAuthCapable = value;
-  if (gContext) {
-    gContext.globalState.update('dsh.authCapable', value).then(() => {}, () => {});
-  }
-}
-
 function learnDshToken(tokenOrUrl) {
   const token = extractTokenParam(tokenOrUrl);
   if (!token) return false;
   dshLaunchToken = token;
-  if (dshAuthCapable !== true) {
-    setDshAuthCapable(true);
-  }
   if (gContext) {
     gContext.globalState.update(AUTH_PROXY_STATE_KEY, {
       target: getUrl(),
@@ -621,15 +349,7 @@ async function ensureAuthProxy() {
       return null;
     }
     authProxy = proxy;
-    // 优先复用其他窗口/上次会话缓存的令牌与认证能力标记，尽量无感。
-    if (gContext) {
-      try {
-        if (dshAuthCapable === undefined) {
-          const cap = gContext.globalState.get('dsh.authCapable');
-          if (typeof cap === 'boolean') dshAuthCapable = cap;
-        }
-      } catch { /* 忽略缓存读取失败 */ }
-    }
+    // 优先复用其他窗口/上次会话缓存的令牌，尽量无感。
     if (!dshLaunchToken && gContext) {
       try {
         const cache = gContext.globalState.get(AUTH_PROXY_STATE_KEY);
@@ -1022,7 +742,7 @@ async function resolvePanelTarget(isTab) {
 
 /**
  * 认证引导（免打扰策略：仅在确认 401 且无法静默认证时触发，且带 3 分钟冷却）：
- * 提供两个动作——由扩展受管重启 dsh（自动认证，推荐），或粘贴 dsh web 打印的认证链接。
+ * 本扩展不再接管 dsh 进程，因此只提供「粘贴认证链接」或「在浏览器中打开（携带令牌）」。
  * @param {boolean} isTab
  */
 function maybeGuideAuth(isTab) {
@@ -1031,31 +751,14 @@ function maybeGuideAuth(isTab) {
   lastAuthPromptAt = now;
   const hasProxy = !!authProxy; // 无代理 = 真远程/非回环：给浏览器认证出路
   const actions = hasProxy
-    ? ['重启并自动认证（推荐）', '粘贴认证链接']
+    ? ['粘贴认证链接']
     : ['在浏览器中打开（携带令牌）', '粘贴认证链接'];
   const message = hasProxy
-    ? '新版 dsh web 启用了浏览器认证，当前实例不是由本窗口启动，无法静默认证。'
-    : '新版 dsh web 需要浏览器认证，当前 Remote/非回环场景无法在面板内自动代理认证。';
+    ? 'dsh web 启用了浏览器认证，且扩展未持有该实例的启动令牌，无法静默认证。'
+    : 'dsh web 需要浏览器认证，当前 Remote/非回环场景无法在面板内自动代理认证。';
   vscode.window.showWarningMessage(message, ...actions).then(async (choice) => {
     if (!choice) return;
-    if (choice === '重启并自动认证（推荐）') {
-      const ok = await vscode.window.withProgress({
-        location: vscode.ProgressLocation.Notification,
-        title: '正在重启 dsh web 以完成自动认证…',
-        cancellable: false
-      }, async () => {
-        const installed = await ensureDshInstalled();
-        if (!installed) return false;
-        return restartDsh();
-      });
-      if (ok) {
-        lastAuthPromptAt = 0;
-        if (isTab && tabReloadFn) tabReloadFn();
-        else if (activeView) render(activeView);
-      } else {
-        vscode.window.showErrorMessage('dsh web 重启失败，请手动重启后重试。');
-      }
-    } else if (choice === '在浏览器中打开（携带令牌）') {
+    if (choice === '在浏览器中打开（携带令牌）') {
       await vscode.commands.executeCommand('dshPanel.openInBrowser');
       lastAuthPromptAt = 0;
       // 浏览器完成认证后，用户可手动刷新面板查看（真远程面板仍无法带 Cookie）。
@@ -1090,317 +793,12 @@ async function apiBase() {
 }
 
 /**
- * 启动 dsh web 进程。Windows 通过 shell 执行以命中 dsh.cmd shim。
- * 兼容新旧版本：--no-open 先经 `dsh web --help` 探测，老版本不支持时不传，
- * 避免未知参数导致启动失败。
- * @returns {Promise<import('child_process').ChildProcess>}
- */
-async function startDsh() {
-  // 使用 ensureDshInstalled 解析出的启动方式（全局 dsh 或 npx）。
-  // 兜底回退到配置的命令，避免异常时序下拿到空值。
-  const inv = dshInvocation || { cmd: getDshCommand(), prefix: [] };
-  // host/port 均已净化（getHost 白名单 / getPort 整数），cmd 经 sanitizeCommand
-  // 拒绝 shell 元字符——Semgrep detect-child-process 指示的 shell:true 在此数据流
-  // 下无注入面（win32 需 shell 命中 dsh.cmd shim，POSIX 不经 shell）。
-  // 纵深校验（PR #12 思路）：cmd 来自 getDshCommand()（已净化），此处再拒一次。
-  if (typeof inv.cmd !== 'string' || inv.cmd === '' || SHELL_META_PATTERN.test(inv.cmd)) {
-    throw new Error('dsh 命令包含 shell 元字符或为空，已拒绝启动');
-  }
-  const args = [
-    ...inv.prefix,
-    'web',
-    '--host', String(getHost()),
-    '--port', String(getPort())
-  ];
-  // dsh 0.1.2-rc 起的 web 浏览器认证由扩展自动完成（受管认证代理），
-  // 默认不再弹系统浏览器；需要保留旧行为时打开 dshPanel.openSystemBrowser。
-  // 老版本 dsh 不识别 --no-open：探测支持才传，探测失败按支持处理（仍有回退）。
-  if (!cfg().get('dshPanel.openSystemBrowser', false) && (dshNoOpenBroken !== true)) {
-    if (await dshWebSupportsNoOpen(inv)) {
-      args.push('--no-open');
-    }
-  }
-  // Windows 经 cmd.exe 启动：含空格的 cmd 需区分两种形态——
-  //   a) 单个存在的可执行文件（带空格目录）→ 整体加引号；
-  //   b) 多 token 命令行前缀（如 "node C:\x\dsh.js"）→ 原样透传由 shell 分词（≤0.8.33 行为）。
-  const cmdText = (process.platform === 'win32' && /\s/.test(inv.cmd) && fs.existsSync(inv.cmd)) ? '"' + inv.cmd + '"' : inv.cmd;
-  const child = spawn(cmdText, args, {
-    cwd: getWorkspaceDir(),
-    shell: process.platform === 'win32',
-    windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-  managedChild = child;
-  attachDshOutputReader(child);
-
-  child.on('error', (err) => {
-    if (activeView) {
-      activeView.description = '启动失败';
-    }
-    vscode.window.showErrorMessage(`DeepSeek Harness 启动失败: ${err.message}`);
-  });
-  child.on('exit', (code) => {
-    if (managedChild === child) {
-      managedChild = null;
-    }
-  });
-
-  return child;
-}
-
-/**
- * 探测当前 dsh 的 web 子命令是否支持 --no-open（读 `dsh web --help` 输出）。
- * 结果按进程缓存；探测异常时按支持处理（保留 dshNoOpenBroken 回退兜底）。
- * @param {{cmd: string, prefix: string[]}} inv
+ * 探测 DSH 服务是否已在运行（任意 HTTP 响应即算在线，401 也算）。
+ * 本扩展不启动、不安装、不重启 dsh —— 服务必须由用户/外部进程自行拉起。
  * @returns {Promise<boolean>}
  */
-async function dshWebSupportsNoOpen(inv) {
-  if (dshNoOpenSupported !== undefined) return dshNoOpenSupported;
-  try {
-    const out = await runCommandOutput(inv.cmd, [...inv.prefix, 'web', '--help'], 12000);
-    dshNoOpenSupported = /--no-open/.test(out);
-  } catch {
-    dshNoOpenSupported = true;
-  }
-  if (dshNoOpenSupported === false) {
-    dshNoOpenBroken = true; // 老版本：不再尝试该参数（等待逻辑也直接跳过认证链接等待）
-  }
-  return dshNoOpenSupported;
-}
-
-/**
- * 逐行读取 dsh web 的 stdout：
- * - 捕获「完全启动」信号：任何 `dsh web: <url>` 打印行（新版带 token=，
- *   老版为纯 URL，都代表 dsh 自身就绪）；
- * - 带令牌的行交给 learnDshToken（认证代理据此换发 Cookie）；
- * - 不带令牌的行说明当前 dsh 无 web 认证（老版本），记 dshAuthCapable=false。
- * stderr 仅记录日志便于排障。
- * @param {import('child_process').ChildProcess} child
- */
-function attachDshOutputReader(child) {
-  let buf = '';
-  const onData = (chunk) => {
-    buf += chunk.toString('utf8');
-    let idx;
-    while ((idx = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, idx).replace(/\r$/, '');
-      buf = buf.slice(idx + 1);
-      const m = line.match(/dsh web:\s*(\S+)/);
-      if (m) {
-        dshBootAnnouncedAt = Date.now();
-        if (extractTokenParam(m[1])) {
-          learnDshToken(m[1]);
-        } else if (dshAuthCapable !== true) {
-          setDshAuthCapable(false); // 老版 dsh：URL 无 token 参数
-        }
-      }
-      if (line.indexOf('opening the default browser') >= 0) {
-        // --no-open 未生效（老版本不支持该参数等）：提示一次便于定位。
-        console.warn('[DeepSeek Harness] dsh 自行打开了系统浏览器（--no-open 未生效）。' +
-          '新版 dsh 由扩展自动抑制弹页；若仍弹页请检查 dshPanel.openSystemBrowser 与 dsh 配置。');
-      }
-    }
-    if (buf.length > 64 * 1024) buf = '';
-  };
-  if (child.stdout) child.stdout.on('data', onData);
-  if (child.stderr) {
-    child.stderr.on('data', (chunk) => {
-      const s = chunk.toString('utf8').trimEnd();
-      if (s) console.error('[dsh web]', s);
-    });
-  }
-}
-
-/**
- * 杀掉进程树。Windows 上 spawn 走 shell 时，child.kill() 只能杀 cmd.exe，
- * 需要 taskkill /t 才能连同真正的 node 进程一起结束。
- */
-function killTree(child) {
-  if (!child || child.pid == null) return;
-  if (process.platform === 'win32') {
-    spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
-      stdio: 'ignore',
-      windowsHide: true
-    });
-  } else {
-    try {
-      process.kill(-child.pid, 'SIGTERM');
-    } catch (_) {
-      child.kill('SIGTERM');
-    }
-  }
-}
-
-/**
- * 确保 DSH 正在运行：检测 ->（未运行时）启动 -> 轮询等待就绪。
- * 返回是否成功就绪。
- * @returns {Promise<boolean>}
- */
-async function ensureRunning() {
-  const url = getUrl();
-  const autoStart = cfg().get('dshPanel.autoStart', true);
-
-  if (await checkUrl(url)) {
-    return true; // 已有服务，直接复用
-  }
-
-  if (!autoStart) {
-    return false;
-  }
-
-  return startDshAndWaitReady(url);
-}
-
-/**
- * 启动 dsh 并等待就绪（最多约 30 秒）。
- * 老版本 dsh 可能不识别 --no-open（启动即退出）：自动去掉该参数重试一次。
- * @param {string} url
- * @returns {Promise<boolean>}
- */
-async function startDshAndWaitReady(url) {
-  // 记录启动前的「启动广播」快照：dsh 完全就绪（插件/连接加载完）才会打印
-  // `dsh web: <url>` 行——新版带 token=，老版为纯 URL。端口可达 ≠ 就绪，
-  // 过早渲染 iframe 会让前端在半就绪服务上启动失败（表现为重启后首次
-  // 加载不出来、刷新一次才好）。
-  const announceBefore = dshBootAnnouncedAt;
-  if (!await startDshAndAwaitPort(url)) {
-    return false;
-  }
-  return await waitDshFullBoot(announceBefore);
-}
-
-/** 端口可达即返回（401 也算）；含「探测漏判 --no-open」时的一次去参重试。 */
-async function startDshAndAwaitPort(url) {
-  startDsh().catch(() => {});
-  for (let i = 0; i < 60; i++) {
-    await sleep(500);
-    if (await checkUrl(url)) {
-      return true;
-    }
-  }
-  if (!dshNoOpenBroken && !cfg().get('dshPanel.openSystemBrowser', false)) {
-    // 兜底：探测误判（如 --help 输出异常）导致带参启动失败，去掉参数重试一次。
-    startDsh().catch(() => {});
-    for (let i = 0; i < 60; i++) {
-      await sleep(500);
-      if (await checkUrl(url)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-/**
- * 等待本次启动的 dsh 打印启动广播行（完全启动信号，新旧版本通用）。
- * - 「从不广播的安静 dsh」在 globalState 记忆（dsh.quietBoot），之后直接跳过；
- * - 广播超时的兜底：进程仍存活则放行（渲染前还有代理自检兜底），并记忆
- *   quietBoot，之后不再等待。
- * @param {number} announceBefore 启动前的广播时间戳快照
- * @returns {Promise<boolean>}
- */
-async function waitDshFullBoot(announceBefore) {
-  if (gContext && gContext.globalState.get('dsh.quietBoot') === true) {
-    return true;
-  }
-  const budget = dshAuthCapable === true ? 30000 : 20000;
-  const deadline = Date.now() + budget;
-  while (Date.now() < deadline) {
-    await sleep(250);
-    if (managedChild === null) {
-      return false; // 启动即退出/被杀
-    }
-    if (dshBootAnnouncedAt !== announceBefore) {
-      // 广播到位；带令牌时认证代理已开始预换 Cookie，稍候片刻。
-      await sleep(300);
-      return true;
-    }
-  }
-  if (managedChild === null) {
-    return false;
-  }
-  // 进程存活但始终没有广播行（极老版本的安静 dsh）：记忆后不再等待。
-  if (gContext) {
-    gContext.globalState.update('dsh.quietBoot', true).then(() => {}, () => {});
-  }
-  return true;
-}
-
-/**
- * 并发去重：确保无论有多少视图同时 resolve，都只跑一次启动流程。
- */
-function ensureRunningOnce() {
-  if (!ensurePromise) {
-    ensurePromise = ensureRunning().finally(() => {
-      ensurePromise = null;
-    });
-  }
-  return ensurePromise;
-}
-
-/**
- * 释放指定端口上监听的进程（best-effort）。
- * 用于「重启」：本窗口持有的 dsh 由 killTree 结束，这里再兜底清掉本窗口未持有的
- * dsh（外部启动 / 残留进程），确保新进程能成功绑定端口。仅在用户确认重启后调用。
- * @param {number} port
- * @returns {Promise<void>}
- */
-function freePort(port) {
-  return new Promise((resolve) => {
-    if (process.platform === 'win32') {
-      exec('netstat -ano -p tcp', { windowsHide: true, timeout: 10000 }, (err, stdout) => {
-        if (err) { resolve(); return; }
-        const pids = new Set();
-        for (const line of (stdout || '').split(/\r?\n/)) {
-          const parts = line.trim().split(/\s+/);
-          if (parts.length >= 5 &&
-              parts[0].toUpperCase() === 'TCP' &&
-              parts[1] && parts[1].endsWith(`:${port}`) &&
-              parts[3] && parts[3].toUpperCase() === 'LISTENING' &&
-              parts[4]) {
-            pids.add(parts[4]);
-          }
-        }
-        if (pids.size === 0) { resolve(); return; }
-        let remaining = pids.size;
-        const done = () => { if (--remaining === 0) resolve(); };
-        for (const pid of pids) {
-          const k = spawn('taskkill', ['/pid', pid, '/t', '/f'], { stdio: 'ignore', windowsHide: true });
-          k.on('exit', done);
-          k.on('error', done);
-        }
-      });
-    } else {
-      // POSIX：fuser 优先，失败退回 lsof + kill。命令本身 best-effort，忽略退出码。
-      exec(`fuser -k ${port}/tcp 2>/dev/null`, { timeout: 10000 }, () => {
-        exec(`lsof -ti:${port} 2>/dev/null | xargs -r kill -9 2>/dev/null`, { timeout: 10000 }, () => resolve());
-      });
-    }
-  });
-}
-
-/**
- * 重启 dsh web：停掉当前 dsh、释放端口、重新启动并等待就绪。
- * 本窗口持有的 dsh 直接 killTree；本窗口未持有的（外部启动/残留）由 freePort 按端口释放，
- * 调用方需先征得用户确认，避免误杀其他窗口正在使用的 dsh。
- * @returns {Promise<boolean>} 是否重启成功就绪。
- */
-async function restartDsh() {
-  const url = getUrl();
-  // 1. 结束本窗口启动的 dsh 进程树。
-  if (managedChild) {
-    killTree(managedChild);
-    managedChild = null;
-  }
-  // 2. 释放端口（兜底外部启动 / 残留进程）。
-  await freePort(getPort());
-  // 3. 等端口真正释放（最多约 5 秒）。
-  for (let i = 0; i < 10; i++) {
-    await sleep(500);
-    if (!(await checkUrl(url))) break;
-  }
-  // 4. 重新启动并等待就绪（最多约 30 秒；含 --no-open 兼容回退）。
-  return startDshAndWaitReady(url);
+function isServiceUp() {
+  return checkUrl(getUrl());
 }
 
 /**
@@ -2021,42 +1419,25 @@ function getTabDisplayUrl(displayUrl) {
 }
 
 /**
- * 准备面板内容 HTML：确保 dsh 已安装、配套插件在位、服务就绪，
- * 返回 iframe HTML 或错误。侧边栏视图与编辑器标签页共用。
+ * 准备面板内容 HTML：确认服务可达、配套插件在位，返回 iframe HTML 或错误。
+ * 侧边栏视图与编辑器标签页共用。
  * @param {boolean} [isTab] 是否为标签页模式（标签页用不同 origin 以与侧边栏隔离）。
- * @returns {Promise<{ok: true, html: string} | {ok: false, kind: 'not-installed'|'unreachable'|'unloadable'|'unauthorized', reason: string}>}
+ * @returns {Promise<{ok: true, html: string} | {ok: false, kind: 'unreachable'|'unloadable'|'unauthorized', reason: string}>}
  */
 async function preparePanelHtml(isTab) {
-  // 本机 dsh 只用于「自动启动」与「本地插件管理」。服务已经在跑时（DSH 由 fnOS
-  // 打包应用等外部进程托管）不应因本机没有 dsh 可执行文件而拒绝接入或弹安装提示。
-  const serviceAlreadyUp = await checkUrl(getUrl());
-  const dshReady = serviceAlreadyUp
-    ? await ensureDshInstalled({ silent: true })
-    : await ensureDshInstalled();
-  if (!dshReady && !serviceAlreadyUp) {
-    return {
-      ok: false,
-      kind: 'not-installed',
-      reason: '未检测到 DeepSeek Harness (dsh)，且已取消安装。请手动安装后点击“刷新”。'
-    };
-  }
-
-  if (dshReady) {
-    // 自动确保 DSH 侧配套插件 dsh-drop-caret 在位（拖文件/代码段插入对话框）。
-    const pluginInstalled = await ensureDshPlugins();
-    if (pluginInstalled && serviceAlreadyUp) {
-      // 服务已在运行但插件刚装上，需重启 dsh web 才加载。
-      vscode.window.showInformationMessage('已自动安装/更新 DSH 插件（dsh-drop-caret / dsh-webview-clipboard），请点击面板顶部的「重启 dsh web」使其生效。');
-    }
-  }
-
-  const ok = await ensureRunningOnce();
-  if (!ok) {
+  // 本扩展不启动 dsh：服务必须已经在 dshPanel.url 上监听着。
+  if (!await isServiceUp()) {
     return {
       ok: false,
       kind: 'unreachable',
-      reason: `无法连接 ${getUrl()}，且自动启动未成功（或已关闭自动启动）。`
+      reason: `无法连接 ${getUrl()}。本扩展只接入已启动的 DSH 服务，不会自动启动 dsh，` +
+        '请先在目标机器上启动 DSH（如 dsh --profile web --port 8080），再点击「刷新」。'
     };
+  }
+
+  // 尽力确保 DSH 侧配套插件 dsh-drop-caret 在位（拖文件/代码段插入对话框）。
+  if (await ensureDshPlugins()) {
+    vscode.window.showInformationMessage('已自动安装/更新 DSH 插件（dsh-drop-caret / dsh-webview-clipboard），重启 DSH 服务后生效。');
   }
 
   // 服务就绪后，尽力把 VSCode 当前工作区注册进 DSH 工作区列表（不阻塞渲染）。
@@ -2071,10 +1452,10 @@ async function preparePanelHtml(isTab) {
       ok: false,
       kind: 'unauthorized',
       reason: hasProxy
-        ? 'dsh web 新版启用了浏览器认证，当前实例不是由本窗口启动，无法静默认证。' +
-          '点击面板顶部的「重启 dsh web」，由扩展接管并自动完成认证。'
-        : 'dsh web 新版需要浏览器认证，当前 Remote/非回环场景无法在面板内自动代理认证。' +
-          '请查看通知：在浏览器中打开携带令牌的链接完成认证，或粘贴 dsh web 打印的认证链接。'
+        ? 'dsh web 启用了浏览器认证，扩展尚未持有该实例的启动令牌。' +
+          '请在通知里点「粘贴认证链接」，或把令牌/令牌文件路径填进 dshPanel.authTokenFile。'
+        : 'dsh web 需要浏览器认证，当前 Remote/非回环场景无法在面板内自动代理认证。' +
+          '请查看通知：在浏览器中打开携带令牌的链接完成认证，或粘贴 dsh 打印的认证链接。'
     };
   }
   try {
@@ -3021,17 +2402,10 @@ async function handleDshModelRequest(model, messages, options, progress, token) 
       }
       return;
     }
-    // 与面板一致：服务已在运行时不需要本机 dsh（DSH 可能由 fnOS 打包应用等外部进程
-    // 托管）；本机 dsh 只在「服务没跑、需要自动启动」时才有必要。
-    const serviceAlreadyUp = await checkUrl(getUrl());
-    const installed = serviceAlreadyUp || await ensureDshInstalled();
-    if (!installed) {
-      progress.report(makeTextPart('❌ 未检测到 DeepSeek Harness (dsh)。请安装 npm install -g @deepseek-ai/dsh，或打开 DSH 面板触发自动安装。'));
-      return;
-    }
-    const running = await ensureRunningOnce();
-    if (!running) {
-      progress.report(makeTextPart('❌ 无法连接 DSH 服务（' + getUrl() + '）。请打开 DSH 面板确认其已启动。'));
+    // 本扩展不启动 dsh：服务必须已经在跑（由用户/外部进程拉起）。
+    if (!await isServiceUp()) {
+      progress.report(makeTextPart('❌ 无法连接 DSH 服务（' + getUrl() + '）。' +
+        '本扩展只接入已启动的 DSH，请先启动 DSH 服务（如 dsh --profile web --port 8080）。'));
       return;
     }
 
@@ -3639,8 +3013,8 @@ function activate(context) {
 
   const refreshCmd = vscode.commands.registerCommand('dshPanel.refresh', () => {
     if (activeView) {
-      // 始终重载面板页面：render 会重建 iframe 重新加载 DSH Web GUI；
-      // 服务在线时 ensureRunningOnce 仅复用不重启，不影响 dsh web 进程与运行中的任务。
+      // 始终重载面板页面：render 会重建 iframe 重新加载 DSH Web GUI，
+      // 不触碰 dsh 进程，不影响运行中的任务。
       render(activeView);
     } else {
       vscode.window.showInformationMessage('DeepSeek Harness 面板尚未打开，请先点击侧边栏图标。');
@@ -3663,63 +3037,6 @@ function activate(context) {
       } catch { /* 保持裸地址 */ }
     }
     vscode.env.openExternal(vscode.Uri.parse(url));
-  });
-
-  const restartCmd = vscode.commands.registerCommand('dshPanel.restart', async () => {
-    if (!activeView) {
-      vscode.window.showInformationMessage('DeepSeek Harness 面板尚未打开，请先点击侧边栏图标。');
-      return;
-    }
-    const view = activeView;
-
-    // dsh 正在运行、且不是本窗口启动时，重启会中断其他窗口的任务，先征得确认。
-    // dsh 未运行、或本就是本窗口启动时，无需确认直接重启/启动。
-    const running = await checkUrl(getUrl());
-    if (running && !managedChild) {
-      const choice = await vscode.window.showWarningMessage(
-        '当前 dsh web 不是由本窗口启动的，重启会中断所有正在使用它的窗口及其任务。确定要重启吗？',
-        { modal: true },
-        '重启'
-      );
-      if (choice !== '重启') {
-        return;
-      }
-    }
-
-    view.description = '正在重启';
-    view.webview.html = buildLoadingHtml();
-
-    const installed = await ensureDshInstalled();
-    if (activeView !== view) return;
-    if (!installed) {
-      view.description = '未安装 dsh';
-      view.webview.html = buildErrorHtml('未检测到 DeepSeek Harness (dsh)，无法重启。请先安装后重试。');
-      return;
-    }
-
-    const ok = await restartDsh();
-    if (activeView !== view) return;
-    if (ok) {
-      registerWorkspace().catch(() => {});
-      const target = await resolvePanelTarget(false);
-      if (activeView !== view) return;
-      if (target.unauthorized) {
-        maybeGuideAuth(false);
-        view.description = '等待认证';
-        view.webview.html = buildErrorHtml('dsh web 需要浏览器认证，且当前实例无法静默认证。请查看通知提示完成接管或粘贴认证链接。');
-        return;
-      }
-      view.description = getUrl();
-      try {
-        view.webview.html = buildIframeHtml(target.displayUrl, getFontScale());
-      } catch (e) {
-        view.description = '无法加载';
-        view.webview.html = buildErrorHtml(e.message);
-      }
-    } else {
-      view.description = '重启失败';
-      view.webview.html = buildErrorHtml('重启 dsh web 后仍无法连接，请确认端口未被占用或 dsh 可正常启动。');
-    }
   });
 
   // VS Code 切换工作区（文件夹）时，把新工作区也注册进 DSH 列表。
@@ -3778,17 +3095,12 @@ function activate(context) {
     vscode.window.showInformationMessage('已重置 DSH 会话映射：下次提问将创建新的 DSH 会话。');
   });
 
-  context.subscriptions.push(viewSub, openInTabCmd, refreshCmd, openBrowserCmd, restartCmd, wsSub, sendSelectionCmd, chatStatusCmd, diagnoseModelsCmd, resetChatCmd);
+  context.subscriptions.push(viewSub, openInTabCmd, refreshCmd, openBrowserCmd, wsSub, sendSelectionCmd, chatStatusCmd, diagnoseModelsCmd, resetChatCmd);
 }
 
 function deactivate() {
   stopAuthTokenWatcher();
-  // 扩展停用时，按配置决定是否结束由本扩展启动的 dsh 进程。
-  const killOnDispose = cfg().get('dshPanel.killOnDispose', true);
-  if (killOnDispose && managedChild) {
-    killTree(managedChild);
-    managedChild = null;
-  }
+  // 本扩展不持有 dsh 进程，无需结束任何子进程。
   // 关闭受管认证代理（令牌已缓存进 globalState，下次启动可无感复用）。
   if (authProxy) {
     const p = authProxy;
@@ -3810,17 +3122,11 @@ module.exports.__internals = {
   extractTokenParam,
   apiBase,
   normAuthority,
-  startDshAndWaitReady,
+  isServiceUp,
   preparePanelHtml,
   clipboardPluginFiles,
   CLIPBOARD_PLUGIN_NAME,
-  sanitizeCommand,
   getUrl,
-  getHost,
-  getPort,
-  getDshCommand,
-  runCommandOk,
-  runCommandOutput,
   isLocalLoopbackTarget,
   probeDirectIndexStatus
 };
