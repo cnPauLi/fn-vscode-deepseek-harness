@@ -43,20 +43,29 @@ function getUrl() {
 }
 
 /**
- * 将服务地址转换为 webview 可访问的显示地址。
- * 本地场景返回原地址；Remote/vscode-server 场景通过 asExternalUri
- * 自动建立端口转发（可能是带本地转发端口的地址，也可能是 HTTPS 转发域名），
- * 把远程 3080 暴露到本地供 iframe 加载。
+ * 把地址转换成 **webview 侧真正可达**的地址。
+ *
+ * 本地桌面 VS Code：webview 与扩展宿主同机，原样返回。
+ * Remote-SSH / 浏览器版 VS Code（web）：webview 跑在**客户端**（另一台机器或浏览器）里，
+ * 回环地址（`http://127.0.0.1:<port>`）在那边指向的是客户端自己的本机——通常是空的。
+ * 这类场景必须经 asExternalUri 换成端口转发后的外部地址（形如
+ * `http://localhost:<转发端口>` 或 `https://host/app/.../proxy/<端口>/`）。
+ * @param {string} url
  * @returns {Promise<string>}
  */
-async function resolveDisplayUrl() {
-  const url = getUrl();
+async function toWebviewUrl(url) {
   try {
     const external = await vscode.env.asExternalUri(vscode.Uri.parse(url));
-    return external.toString();
+    const s = external && typeof external.toString === 'function' ? external.toString() : '';
+    return s || url;
   } catch {
     return url;
   }
+}
+
+/** 将服务地址转换为 webview 可访问的显示地址。 */
+async function resolveDisplayUrl() {
+  return toWebviewUrl(getUrl());
 }
 
 /**
@@ -723,7 +732,9 @@ async function resolvePanelTarget(isTab) {
   }
   await proxy.waitAuthed(8000);
   if (proxy.hasCookieForBase()) {
-    displayUrl = isTab ? proxy.urlForTab() : proxy.baseUrl();
+    // 代理监听在回环随机端口：本地桌面场景可直接用；Remote / 浏览器版 VS Code 下
+    // webview 不在扩展宿主这台机器上，必须映射成外部可达地址，否则 iframe 打不开（白屏）。
+    displayUrl = await toWebviewUrl(isTab ? proxy.urlForTab() : proxy.baseUrl());
     // 端到端就绪确认：代理链路（注入 Cookie → 上游 → 回包）拿到 200 才交给
     // iframe，避免 dsh 半就绪（端口已监听但插件/连接未加载完）导致首次加载失败。
     const deadline = Date.now() + 6000;
@@ -3123,6 +3134,8 @@ module.exports.__internals = {
   apiBase,
   normAuthority,
   isServiceUp,
+  toWebviewUrl,
+  resolvePanelTarget,
   preparePanelHtml,
   clipboardPluginFiles,
   CLIPBOARD_PLUGIN_NAME,
