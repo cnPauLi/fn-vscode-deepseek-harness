@@ -1051,7 +1051,15 @@ const NPMJS_REGISTRY = 'https://registry.npmjs.org/';
 const CLIPBOARD_PLUGIN_NAME = 'dsh-webview-clipboard';
 const CLIPBOARD_PLUGIN_VERSION = '0.2.1';
 
+/**
+ * DSH 的 home 目录（其下有 profiles/web）。优先级：
+ * dshPanel.dshHome 配置 → 环境变量 DSH_HOME → `~/.dsh`。
+ * DSH 由别的程序托管时（如 fnOS 打包应用用自己的 HOME/DSH_HOME），
+ * 扩展默认那个位置通常并不存在，可用配置指到真正的 DSH home。
+ */
 function dshHomeDir() {
+  const configured = String(cfg().get('dshPanel.dshHome', '') || '').trim();
+  if (configured) return configured;
   return process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 }
 
@@ -1368,6 +1376,10 @@ async function ensureClipboardPlugin(profileDir) {
  */
 async function ensureDshPlugins() {
   const profileDir = dshWebProfileDir();
+  // DSH 的 web profile 不在本机（DSH 由 fnOS 打包应用等别的程序托管，HOME/DSH_HOME
+  // 与本扩展不同）时：不写入、不报错——插件归其管理端负责；确需在此安装可用
+  // dshPanel.dshHome 把 DSH home 指过去。
+  if (!fs.existsSync(profileDir)) return false;
   try {
     const installed = await installedPluginVersion(profileDir, DSH_PLUGIN_NAME);
     await ensureProfileDeclaration(profileDir, DSH_PLUGIN_NAME, `^${DSH_PLUGIN_MIN}`);
@@ -3154,6 +3166,8 @@ module.exports.__internals = {
   toWebviewUrl,
   resolvePanelTarget,
   preparePanelHtml,
+  ensureDshPlugins,
+  dshWebProfileDir,
   clipboardPluginFiles,
   CLIPBOARD_PLUGIN_NAME,
   getUrl,

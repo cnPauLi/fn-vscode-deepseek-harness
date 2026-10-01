@@ -67,6 +67,7 @@
 | `dshPanel.authTokenFile` | 空 | DSH 的启动凭据：可填**令牌文件路径**，也可**直接填令牌本身**或含 `token=` 的认证链接。留空=不启用 |
 | `dshPanel.autoRegisterWorkspace` | `true` | 是否把当前工作区自动注册为 DSH 工作区 |
 | `dshPanel.installClipboardPlugin` | `true` | 是否写入内置 `dsh-webview-clipboard` 插件（修复 macOS 面板内编辑快捷键；Windows/Linux 上为惰性文件不影响行为）；是否启用由 DSH 侧决定 |
+| `dshPanel.dshHome` | 空 | DSH 的 home 目录（其下有 `profiles/web`），配套插件（`dsh-drop-caret` / 剪贴板兼容插件）写到这里。留空=取 `DSH_HOME` 环境变量，再回退 `~/.dsh`；DSH 由别的程序托管（如 fnOS 打包应用）时默认位置不存在，扩展会**跳过插件安装且不报错**，要把插件装到该 DSH 上就把它真实的 home 填进来 |
 
 > 本扩展已移除全部「主动启动 dsh」相关能力与配置（`autoStart` / `autoInstallDsh` / `dshCommand` / `killOnDispose` / `openSystemBrowser` / `host` / `port` 及「重启 dsh web」按钮）：服务生命周期完全由你掌控。
 
